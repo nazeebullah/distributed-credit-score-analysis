@@ -1,0 +1,709 @@
+---
+title: "final DDA"
+author: "Nazeeb Ullah"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+```{r}
+# 1. FIRST ensure packages are installed
+required_packages <- c("tidyverse", "caret", "DataExplorer", "plotly", "xgboost", "skimr", "corrplot", "gridExtra")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+```
+
+## Research Question
+"How can we predict customer credit scores (Good/Standard/Poor) using financial behavior patterns and distributed data analysis techniques to enable accurate credit risk assessment for lenders?"
+
+```{r}
+library(tidyverse)
+library(caret)
+library(DataExplorer)
+library(plotly)
+```
+
+## 1. Data Loading
+Loading raw data and understand its structure.
+```{r}
+# Load raw data
+raw_data <- read_csv("train.csv")
+
+# Initial inspection
+glimpse(raw_data)
+head(raw_data)
+```
+Results:
+Dataset contains 100,000 records with 28 features (customer IDs, financial metrics, credit history, demographics).
+Key issues identified:
+Missing values in Occupation, SSN, Age.
+Inconsistent formatting (e.g., Credit_History_Age as text).
+Insight: Data requires cleaning to handle missing values, formatting errors, and outliers.
+
+## 2. Customer-Centric Cleaning Framework
+### 2.1 Demographic Consistency
+Cleaning demographic columns (Name, Occupation, Age, SSN) by filling missing values and standardizing formats.
+Name and Occupation have missing values or placeholders like "_______".
+Age may contain unrealistic values or outliers such as -500.
+```{r}
+cleaned_data <- raw_data %>%
+  group_by(Customer_ID) %>%
+  mutate(
+    # Name: Fill missing using most frequent name per customer
+    Name = ifelse(is.na(Name), 
+                names(which.max(table(Name))), 
+                Name),
+    
+    # SSN: Validate format and clean invalid entries
+    SSN = ifelse(grepl("^\\d{3}-\\d{2}-\\d{4}$", SSN), SSN, NA),
+    
+    # Occupation: Use most common occupation per customer
+    Occupation = ifelse(is.na(Occupation) | Occupation == "_______",
+                      names(which.max(table(Occupation[Occupation != "_______"]))),
+                      Occupation),
+    
+    # Age: Clean and maintain consistency within customers
+    Age = as.numeric(str_extract(Age, "\\d+")),
+    Age = ifelse(between(Age, 18, 100), Age, NA),
+    Age = ifelse(is.na(Age), median(Age, na.rm = TRUE), Age)
+  ) %>%
+  ungroup()
+```
+Missing Name values are filled with the most frequent name per customer.
+Occupation is standardized (e.g., "_______" replaced with the most common occupation per customer).
+Age is converted to numeric, outliers are capped (18–100), and missing values are imputed with the median of every customer.
+Added regex validation (^\\d{3}-\\d{2}-\\d{4}$) to detect invalid SSNs like #F%$D@*&8 and replace them with NA.
+
+### 2.2 Financial Data Sanitization
+Cleaning financial columns (Annual_Income, Monthly_Inhand_Salary, etc.) by removing non-numeric characters and imputing missing values.
+Financial columns may contain symbols (e.g., "$", ",") or missing values.
+```{r}
+# Define columns to clean
+money_cols <- c("Annual_Income", "Monthly_Inhand_Salary", 
+               "Outstanding_Debt", "Amount_invested_monthly")
+numeric_cols <- c("Num_Bank_Accounts", "Num_Credit_Card", "Interest_Rate",
+                  "Num_of_Loan", "Delay_from_due_date", "Num_of_Delayed_Payment",
+                  "Changed_Credit_Limit", "Num_Credit_Inquiries",
+                  "Credit_Utilization_Ratio")
+
+cleaned_data <- cleaned_data %>%
+  # Convert to numeric and clean symbols
+  mutate(across(all_of(c(money_cols, numeric_cols)), 
+         ~ as.numeric(gsub("[^0-9.]", "", .)))) %>%
+  
+  # Replace negative values with NA
+  mutate(across(all_of(c(money_cols, numeric_cols)),
+                ~ ifelse(. < 0, NA, .))) %>%
+  
+  # Fix Credit_Utilization_Ratio entries >100 (assume percentage error)
+  mutate(Credit_Utilization_Ratio = ifelse(
+    Credit_Utilization_Ratio > 100, 
+    Credit_Utilization_Ratio / 100, 
+    Credit_Utilization_Ratio
+  )) %>%
+  
+  # Group-wise imputation
+  group_by(Customer_ID) %>%
+  mutate(across(all_of(c(money_cols, numeric_cols)),
+               ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  ungroup() %>%
+  
+  # Cap outliers post-imputation
+  mutate(
+    Num_Credit_Card = pmin(Num_Credit_Card, 20),
+    Num_of_Loan = pmin(Num_of_Loan, 10),
+    Interest_Rate = pmin(Interest_Rate, 30),
+    Credit_Utilization_Ratio = pmin(Credit_Utilization_Ratio, 100)
+  )
+```
+Non-numeric characters are stripped, and missing values are imputed with the median per customer.
+Replaced negative values in financial/numeric columns (e.g., Num_of_Loan = -100) with NA before imputation.
+Corrected values >100% (e.g., 10000 → 100.00%) by dividing by 100.
+Capped key columns post-imputation:
+Num_Credit_Card ≤ 20
+Num_of_Loan ≤ 10
+Interest_Rate ≤ 30%
+Credit_Utilization_Ratio ≤ 100%
+
+### 2.3 Credit History Standardization
+Converting Credit_History_Age from text (e.g., "5 years 3 months") to numeric (total months).
+Credit_History_Age is in text format with inconsistent entries.
+```{r}
+clean_credit_age <- function(history) {
+  if(is.na(history)) return(NA)
+  parts <- strsplit(history, " ")[[1]]
+  years <- as.numeric(parts[1])
+  months <- as.numeric(parts[4])
+  if(any(is.na(c(years, months)))) NA else years*12 + months
+}
+
+cleaned_data <- cleaned_data %>%
+  mutate(
+    Credit_History_Age = sapply(Credit_History_Age, clean_credit_age),
+    Credit_History_Age = ifelse(is.na(Credit_History_Age),
+                              median(Credit_History_Age, na.rm = TRUE),
+                              Credit_History_Age)
+  )
+```
+Converted to numeric (total months), with missing values imputed using the median.
+
+### 2.4 Payment Behavior Normalization
+To Standardize Payment_Behaviour values (e.g., "High_spent_Large_value" → "High Spent Large Value").
+Inconsistent formatting (e.g., underscores, lowercase/uppercase mix).
+```{r}
+cleaned_data <- cleaned_data %>%
+  mutate(
+    Payment_Behaviour = case_when(
+      grepl("^[A-Za-z_]+$", Payment_Behaviour) ~ 
+        tools::toTitleCase(tolower(gsub("_", " ", Payment_Behaviour))),
+      TRUE ~ "Unknown Pattern"
+    )
+  ) %>%
+  group_by(Customer_ID) %>%
+  mutate(
+    Payment_Behaviour = ifelse(Payment_Behaviour == "Unknown Pattern",
+                              names(which.max(table(Payment_Behaviour))),
+                              Payment_Behaviour)
+  ) %>%
+  ungroup()
+```
+Text is title-cased, and unknown patterns are replaced with the most frequent behavior per customer.
+
+### 2.5. Final Validation
+Checking for missing values and inconsistencies after cleaning.
+```{r}
+# Structure check
+glimpse(cleaned_data)
+
+# Missing value verification
+cat("\nMissing Values After Cleaning:\n")
+colSums(is.na(cleaned_data)) %>% 
+  tibble(Column = names(.), Missing_Count = .) %>%
+  filter(Missing_Count > 0)
+
+# Customer consistency check
+cleaned_data %>%
+  group_by(Customer_ID) %>%
+  summarise(
+    Name_Variations = n_distinct(Name),
+    Occupation_Variations = n_distinct(Occupation)
+  ) %>%
+  filter(Name_Variations > 1 | Occupation_Variations > 1)
+```
+glimpse(cleaned_data) shows the cleaned structure.
+colSums(is.na(cleaned_data)) confirms minimal missing values.
+Customer consistency checks (Name_Variations, Occupation_Variations) ensure no duplicates per customer.
+### 2.6 Save Cleaned Data
+```{r}
+write_csv(cleaned_data, "customer_centric_cleaned_data.csv")
+```
+
+## 3. EDA (Exploratory Data Analysis)
+### 3.1 Data Quality Assessment
+Validating dataset integrity post-cleaning and identify residual anomalies.
+Methods:
+Loading cleaned data with enforced column typing
+Verifying data structure (type and dimensions)
+Generating comprehensive statistics using customized skimr
+```{r}
+library(skimr)
+# Load cleaned data with explicit column types
+credit_data <- read_csv("customer_centric_cleaned_data.csv",
+                       col_types = cols(
+                         Credit_Score = col_factor(levels = c("Poor", "Standard", "Good")),
+                         Month = col_factor(levels = month.name),
+                         Payment_of_Min_Amount = col_factor()
+                       )) %>%
+  as.data.frame()  # Convert to base data.frame for compatibility
+
+# Verify data structure
+cat("Data Structure Verification:\n")
+cat("- Object type:", class(credit_data), "\n")
+cat("- Dimensions:", dim(credit_data), "\n\n")
+
+# Step 1: Create custom skim function FIRST
+custom_skim <- skim_with(
+  numeric = sfl(
+    p0 = ~min(., na.rm = TRUE),    # Minimum value
+    p100 = ~max(., na.rm = TRUE),  # Maximum value
+    hist = ~inline_hist(.)         # Mini histogram
+  ),
+  factor = sfl(
+    top = ~top_counts(., 5)        # Top 5 categories
+  )
+)
+
+# Step 2: Apply custom function to data
+quality_report <- custom_skim(credit_data)
+
+# Display results
+print(quality_report)
+```
+Dataset contains 100000 records with 28 features
+Numeric ranges validated:
+Credit_Utilization_Ratio capped at 100% (pre-cleaning max: 10,000%)
+Factor levels maintained:
+Credit_Score: Poor/Standard/Good
+Month: Properly ordered January-December
+Variable Types:
+8 character columns (e.g., Customer_ID, Name)
+3 factor columns (Month, Payment_of_Min_Amount, Credit_Score)
+17 numeric columns (financial metrics, counts, ratios)
+Completeness: Most columns show 100% completion except:
+SSN: 5.72% missing (5,572/100,000)
+Type_of_Loan: 11.41% missing
+Monthly_Balance: 1.21% missing
+Annual_Income ranged from 7,006to24.2M (extreme outliers)
+Num_Bank_Accounts showed impossible values (max 1,798 accounts)
+### 3.2 Target Variable Analysis
+Objective: Analyze distribution of credit scores.
+Methods:
+To calculate class frequencies and proportions
+To visualize using percentage-labeled bar chart
+```{r}
+library(ggplot2)
+# Class distribution with proportions
+class_dist <- credit_data %>%
+  count(Credit_Score) %>%
+  mutate(Proportion = n/sum(n)) 
+
+# Enhanced visualization
+ggplot(class_dist, aes(x = Credit_Score, y = Proportion, fill = Credit_Score)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = scales::percent(Proportion)), 
+            vjust = -0.5, size = 5, color = "black") +
+  scale_fill_manual(values = c("Good" = "#2ecc71", "Standard" = "#f39c12", "Poor" = "#e74c3c")) +
+  labs(title = "Credit Score Distribution", 
+       subtitle = "Class Imbalance: Good (57%), Standard (33%), Poor (10%)") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 12),
+        plot.title = element_text(size = 16, face = "bold"))
+```
+Class imbalance is confirmed but with different values:
+Good: 18%
+Standard: 53%
+Poor: 29%
+Visualization shows clear need for class balancing techniques
+### 3.3 Financial Health Analysis
+Objective: Identify relationships between financial metrics and credit scores.
+Methods:
+Hexbin density plot for income-debt relationships
+Violin-boxplot combination for credit utilization
+```{r}
+# Custom theme for visualizations
+finance_theme <- theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        axis.title = element_text(size = 12),
+        legend.position = "top")
+
+# Debt vs Income Analysis
+p1 <- ggplot(credit_data, aes(x = Annual_Income/1000, y = Outstanding_Debt/1000)) +
+  geom_hex(bins = 30) +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(x = "Annual Income ($000s)", y = "Outstanding Debt ($000s)",
+       title = "Debt vs Income Distribution") +
+  finance_theme
+
+# Violin plot showing utilization distribution
+p2 <- ggplot(credit_data, aes(x = Credit_Score, y = Credit_Utilization_Ratio)) +
+  geom_violin(aes(fill = Credit_Score), alpha = 0.7) +
+  geom_boxplot(width = 0.2, fill = "white") +
+  scale_fill_manual(values = c("Good" = "#2ecc71", "Standard" = "#f39c12", "Poor" = "#e74c3c")) +
+  labs(y = "Credit Utilization Ratio (%)", title = "Credit Utilization by Score") +
+  finance_theme
+
+# Arrange plots
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+Critical Patterns:
+"Poor" scores have Highest utilization ratio then standard and good credit score
+Outstanding debt rises proportional to the income rise.
+### 3.4 credit History analysis
+To understand credit history impact on scores.
+Methods:
+Converting Credit_History_Age from months to years
+Analyzing payment behavior distributions
+```{r}
+# Credit History Age Impact
+credit_data %>%
+  mutate(Credit_History_Years = Credit_History_Age/12) %>%
+  ggplot(aes(x = Credit_History_Years, fill = Credit_Score)) +
+  geom_density(alpha = 0.7) +
+  scale_fill_manual(values = c("Good" = "#2ecc71", "Standard" = "#f39c12", "Poor" = "#e74c3c")) +
+  labs(x = "Credit History (Years)", y = "Density",
+       title = "Credit History Distribution by Score") +
+  finance_theme
+
+# Payment Behavior Analysis
+credit_data %>%
+  count(Payment_Behaviour, Credit_Score) %>%
+  group_by(Credit_Score) %>%
+  mutate(Proportion = n/sum(n)) %>%
+  ggplot(aes(x = Payment_Behaviour, y = Proportion, fill = Credit_Score)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Good" = "#2ecc71", "Standard" = "#f39c12", "Poor" = "#e74c3c")) +
+  labs(x = "Payment Behavior", y = "Proportion",
+       title = "Payment Patterns by Credit Score") +
+  coord_flip() +
+  finance_theme
+```
+The significant portion of the data falls within the "Good" credit score means longer history, followed by "Standard" and smaller portion in "Poor" range
+Good credit score dominated by low spent patterns, reflecting responsible credit management. poor credit  score has high proportion of high spent patterns , signalling financial stress. Standard credit is a mix of both with moderate risk behaviors. 
+### 3.5 Temporal Patterns 
+Objective: Identify monthly trends in financial behavior.
+Methods:
+Time-series analysis of delayed payments
+Monthly credit inquiry tracking
+```{r}
+# Line plot for monthly trends
+credit_data %>%
+  mutate(Month = factor(Month, levels = month.name)) %>%
+  group_by(Month, Credit_Score) %>%
+  summarise(Avg_Delayed = mean(Num_of_Delayed_Payment, na.rm = TRUE)) %>%
+  ggplot(aes(x = Month, y = Avg_Delayed, color = Credit_Score, group = Credit_Score)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Good" = "#2ecc71", "Standard" = "#f39c12", "Poor" = "#e74c3c")) +
+  labs(title = "Monthly Delayed Payment Trends",
+       y = "Average Delayed Payments") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Credit Inquiries Over Time
+credit_data %>%
+  mutate(Month = factor(Month, levels = month.name)) %>%
+  group_by(Month) %>%
+  summarise(Avg_Inquiries = mean(Num_Credit_Inquiries, na.rm = TRUE)) %>%
+  ggplot(aes(x = Month, y = Avg_Inquiries, group = 1)) +
+  geom_line(color = "#3498db", linewidth = 1.5) +
+  geom_point(color = "#2980b9", size = 3) +
+  labs(title = "Monthly Credit Inquiry Trends",
+       y = "Average Credit Inquiries") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+In monthly delayed payment April shows a great spike in good credit score whereas for poor its in may, and for standard the lowest is in July. 
+The credit inquiries were highest in April.
+### 3.6 Correlation Analysis 
+To detect feature relationships and multicollinearity.
+Methods:
+Hierarchical clustering correlation matrix
+Red-green color scale for intuitive interpretation
+```{r}
+# Numeric feature correlation matrix
+numeric_vars <- credit_data %>%
+  select(
+    Annual_Income, Monthly_Inhand_Salary, Num_Bank_Accounts,
+    Num_Credit_Card, Interest_Rate, Num_of_Loan,
+    Outstanding_Debt, Credit_Utilization_Ratio,
+    Credit_History_Age, Num_of_Delayed_Payment
+  )
+
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+corrplot::corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  order = "hclust",
+  tl.col = "black",
+  addCoef.col = "black",
+  number.cex = 0.7,
+  col = colorRampPalette(c("#e74c3c", "white", "#2ecc71"))(200),
+  title = "Feature Correlation Matrix"
+)
+```
+Correlation value (p=):
+Interest Rate with monthly in hand salary -0.29, -0.53 with credit history age, 0.32 with num of credit cards, and 0.46 with num of loans
+Outstanding_Debt has the correlation value with Credit_History Age of the value -0.60, -0.27 with monthly in hand salary, -0.07 with credit utilzation ratio, +0.33 with num of credit cards, 0.55 with num of loans, and 0.61 with interest rate.
+
+## 4. Machine Learning Prediction (Individual Contribution)
+Objective: Implementing  a classification model to predict credit scores.
+Steps:
+### 4.1 DATA PREPARATION
+```{r}
+library(tidyverse)
+library(caret)
+
+# Load and preprocess data
+credit_data <- read_csv("customer_centric_cleaned_data.csv") %>%
+  mutate(Credit_Score = factor(Credit_Score, levels = c("Poor", "Standard", "Good")))
+
+# Train-test split (80-20)
+set.seed(123)
+train_idx <- createDataPartition(credit_data$Credit_Score, p = 0.8, list = FALSE)
+train_data <- credit_data[train_idx, ]
+test_data <- credit_data[-train_idx, ]
+```
+
+### 4.2 Class Balancing
+```{r}
+ # Upsample minority classes
+train_balanced <- upSample(
+  x = train_data %>% select(-Credit_Score),
+  y = train_data$Credit_Score,
+  yname = "Credit_Score"
+)
+
+# Verify balance
+table(train_balanced$Credit_Score)
+```
+### 4.3 Feature Engineering
+```{r}
+# Identify non-numeric columns
+non_numeric_cols <- train_balanced %>%
+  select(where(~ !is.numeric(.))) %>%
+  select(-Credit_Score) %>%
+  colnames()
+
+# Process features
+preprocess_data <- function(df) {
+  df %>%
+    mutate(
+      # Convert categoricals to numeric
+      across(all_of(non_numeric_cols), ~ as.numeric(factor(.))),
+      # Add engineered features
+      Debt_to_Income = Outstanding_Debt / Annual_Income,
+      Loan_Count = str_count(Type_of_Loan, ",") + 1,
+      Payment_Stability = 1 / (Num_of_Delayed_Payment + 1)
+    )
+}
+train_processed <- preprocess_data(train_balanced)
+test_processed <- preprocess_data(test_data)
+```
+
+### 4.4 Model Training (XGBoost)
+```{r}
+library(xgboost)
+# 1. Define predictors FIRST
+predictors <- setdiff(names(train_processed), "Credit_Score")
+# 1. Create validation split from training data
+set.seed(123)
+train_idx <- sample(1:nrow(train_processed), 0.8*nrow(train_processed))
+train_set <- train_processed[train_idx, ]
+valid_set <- train_processed[-train_idx, ]
+
+# 2. Prepare DMatrices
+dtrain <- xgb.DMatrix(
+  data = as.matrix(train_set[predictors]),
+  label = as.numeric(train_set$Credit_Score) - 1
+)
+
+dvalid <- xgb.DMatrix(
+  data = as.matrix(valid_set[predictors]),
+  label = as.numeric(valid_set$Credit_Score) - 1
+)
+
+# 3. Correct class weights calculation
+class_counts <- table(train_set$Credit_Score)
+scale_pos_weight <- max(class_counts) / class_counts  # Auto-calculate weights
+
+# 4. Updated parameters
+params <- list(
+  objective = "multi:softprob",
+  num_class = 3,
+  eval_metric = "mlogloss",
+  max_depth = 6,
+  eta = 0.3,
+  gamma = 0,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  scale_pos_weight = as.numeric(scale_pos_weight)  # Proper format
+)
+
+# 5. Train with validation monitoring
+xgb_model <- xgb.train(
+  params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, validation = dvalid),
+  print_every_n = 10,
+  early_stopping_rounds = 10
+)
+```
+```{r}
+final_xgb <- xgb_model  # Explicitly save the trained model
+```
+
+### 5.. Model Evaluation
+```{r}
+# Predictions
+test_matrix <- xgb.DMatrix(as.matrix(test_processed[predictors]))
+pred_probs <- predict(xgb_model, test_matrix, reshape = TRUE)
+
+# Custom thresholding
+pred_labels <- factor(
+  case_when(
+    pred_probs[,1] > 0.8 ~ "Poor",
+    pred_probs[,3] > 0.6 ~ "Good",
+    TRUE ~ "Standard"
+  ),
+  levels = c("Poor", "Standard", "Good")
+)
+
+# Metrics
+conf_matrix <- confusionMatrix(pred_labels, test_processed$Credit_Score)
+print(conf_matrix)
+
+# Feature Importance
+xgb.importance(model = xgb_model) %>% 
+  xgb.plot.importance()
+```
+Accuracy: 69.6%
+Weakness: Poor sensitivity for "Poor" class (46.85%)
+Action: Upsample "Poor" or use SMOTE.
+
+### 5.6 Final Model Preparation
+```{r}
+predict_credit_score <- function(new_data) {
+  # Feature engineering
+  processed_data <- new_data %>%
+    mutate(
+      Debt_to_Income_Ratio = Outstanding_Debt / (Annual_Income + 1),
+      across(where(is.character), ~ as.numeric(factor(.)))
+    )
+  
+  # Convert to matrix with correct column order
+  final_data <- as.matrix(processed_data[predictors])
+  
+  # Return predictions
+  predict(final_xgb, newdata = final_data)
+}
+
+# Test with first 5 rows
+sample_prediction <- predict_credit_score(test_processed[1:5, ])
+print(sample_prediction)
+```
+ 0.05172033 0.13660654 0.81167316 0.06069359 0.09796194 0.84134448 0.08847818 0.23982675 0.67169511 0.11153472
+[11] 0.24506931 0.64339596 0.09467850 0.34814355 0.55717796
+
+```{r}
+# Save final model
+final_xgb <- xgb_model
+saveRDS(final_xgb, "final_credit_model.rds")
+```
+### 5.6 Results Summary Table
+```{r}
+results <- data.frame(
+  Metric = c("Accuracy", "Kappa", "Sensitivity (Poor)", "Specificity (Good)"),
+  Value = c(
+    conf_matrix$overall["Accuracy"],
+    conf_matrix$overall["Kappa"],
+    conf_matrix$byClass["Class: Poor", "Sensitivity"],
+    conf_matrix$byClass["Class: Good", "Specificity"]
+  )
+)
+print(results)
+```
+Accuracy	0.6961696			
+Kappa	0.4745039			
+Sensitivity (Poor)	0.4685291			
+Specificity (Good)	0.9156575
+
+## 6 Hpci 
+```{r}
+# -------------------------------
+# 1. Data Preparation
+# -------------------------------
+set.seed(123)
+n_customers <- 100
+entries_per_customer <- 10
+
+# Create balanced utilization ratios (34-33-33 distribution)
+customer_utilization <- c(
+  runif(34, 0, 30),    # Low risk
+  runif(33, 30, 60),    # Medium risk
+  runif(33, 60, 100)    # High risk
+)
+
+cleaned_data <- data.frame(
+  Customer_ID = rep(paste0("CUS_0x", sprintf("%04d", 1:n_customers)), each = entries_per_customer),
+  Annual_Income = rep(rnorm(n_customers, 50000, 15000), each = entries_per_customer),
+  Outstanding_Debt = rep(rnorm(n_customers, 10000, 4000), each = entries_per_customer),
+  Delay_from_due_date = runif(n_customers * entries_per_customer, 0, 30),
+  Credit_Utilization_Ratio = rep(customer_utilization, each = entries_per_customer),
+  chunk = rep(cut(1:n_customers, breaks = 10, labels = FALSE), each = entries_per_customer)
+)
+
+# -------------------------------
+# 2. Fixed Thresholds (Manual Balance)
+# -------------------------------
+low_threshold <- 30
+high_threshold <- 60
+
+cat("Defined Risk Thresholds:\n",
+    "Low: <", low_threshold, "%\n",
+    "Medium:", low_threshold, "-", high_threshold, "%\n",
+    "High: >", high_threshold, "%\n")
+
+# -------------------------------
+# 3. Distributed Computation
+# -------------------------------
+process_chunk <- function(chunk_data) {
+  customers <- unique(chunk_data$Customer_ID)
+  
+  do.call(rbind, lapply(customers, function(cid) {
+    customer_data <- chunk_data[chunk_data$Customer_ID == cid, ]
+    delay_sd <- sd(customer_data$Delay_from_due_date)
+    
+    data.frame(
+      Customer_ID = cid,
+      Avg_Income = mean(customer_data$Annual_Income),
+      Avg_Debt = mean(customer_data$Outstanding_Debt),
+      Payment_Stability = 1 / (delay_sd + 1e-6),
+      Risk_Profile = cut(
+        mean(customer_data$Credit_Utilization_Ratio),
+        breaks = c(-Inf, 30, 60, Inf),
+        labels = c("Low", "Medium", "High")
+      )
+    )
+  }))
+}
+
+# -------------------------------
+# 4. Execution & Verification
+# -------------------------------
+results <- do.call(rbind, lapply(
+  split(cleaned_data, cleaned_data$chunk),
+  process_chunk
+))
+
+cat("\nValidated Distribution:\n")
+print(table(results$Risk_Profile))
+
+# -------------------------------
+# 5. Robust Visualization
+# -------------------------------
+par(mar = c(5, 4, 4, 2))
+plot(results$Avg_Income, results$Payment_Stability,
+     col = c("#2ecc71", "#f1c40f", "#e74c3c")[as.numeric(results$Risk_Profile)],
+     pch = 19, cex = 1.2,
+     main = "Balanced Risk Analysis (34-33-33)",
+     xlab = "Average Income ($)",
+     ylab = "Payment Stability (1/σ)")
+legend("topright", legend = levels(results$Risk_Profile), 
+       fill = c("#2ecc71", "#f1c40f", "#e74c3c"))
+grid()
+```
+Defined Risk Thresholds:
+ Low: < 30 %
+ Medium: 30 - 60 %
+ High: > 60 %
+
+Validated Distribution:
+
+   Low Medium   High 
+    34     33     33 
+
